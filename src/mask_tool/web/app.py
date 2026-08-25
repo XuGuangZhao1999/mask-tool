@@ -786,20 +786,14 @@ def render_sidebar():
         lexicon_info = _get_lexicon_info()
         if lexicon_info:
             st.metric("词库词条", lexicon_info["total"])
-
-            # 2.1: 每个类别可展开查看明细
-            lexicon_data = _get_lexicon_data()
-            if lexicon_data:
-                for cat in sorted(lexicon_data.keys(), key=lambda c: -len(lexicon_data[c])):
-                    label = TYPE_LABELS.get(DetectionType(cat), cat)
-                    count = len(lexicon_data[cat])
-                    with st.expander(f"{label}: {count} 条"):
-                        for word in lexicon_data[cat]:
-                            st.code(word)
         else:
             st.caption("词库未加载")
 
-        # 2.2: 手动录入词条
+        # 表格编辑：支持查看 / 修改 / 删除 / 新增行
+        with st.expander("📋 编辑词库", expanded=False):
+            _render_lexicon_editor()
+
+        # 手动录入词条（适合一次添加多条）
         with st.expander("✏️ 手动录入词条", expanded=False):
             valid_categories = {t.value: TYPE_LABELS.get(t, t.value) for t in DetectionType}
             col_cat, col_word = st.columns([1, 2])
@@ -820,14 +814,21 @@ def render_sidebar():
                     height=70,
                 )
             # "其他"类别：允许自定义
+            custom_cat_name = None
             if input_cat == "custom":
                 custom_cat_name = st.text_input(
                     "自定义类别名称（留空则归入 custom）",
                     key="custom_cat_name",
                     placeholder="如：brand, department...",
                 )
-            if st.button("➕ 添加到词库", use_container_width=True, key="add_words_btn"):
-                _add_words_to_lexicon(input_cat, input_words, custom_cat_name if input_cat == "custom" else None)
+            if st.button("➕ 添加到词库", width="stretch", key="add_words_btn"):
+                if _add_words_to_lexicon(
+                    input_cat,
+                    input_words,
+                    custom_cat_name if input_cat == "custom" else None,
+                ):
+                    _bump_lexicon_editor()
+                    st.rerun()
 
         # 批量导入词库
         with st.expander("📥 批量导入词条", expanded=False):
@@ -838,8 +839,12 @@ def render_sidebar():
                 key="lexicon_upload",
                 label_visibility="collapsed",
             )
-            if import_file:
+            if import_file is not None and st.button(
+                "📥 确认导入", key="confirm_import_lexicon", width="stretch"
+            ):
                 _import_lexicon(import_file)
+                _bump_lexicon_editor()
+                st.rerun()
 
         st.markdown("---")
         st.caption("mask-tool · MIT License")
@@ -860,11 +865,132 @@ def _get_lexicon_data() -> Optional[Dict[str, List[str]]]:
     return None
 
 
-def _add_words_to_lexicon(category: str, words_text: str, custom_category: Optional[str] = None) -> None:
-    """手动添加词条到用户词库"""
+def _category_label(cat: str) -> str:
+    """类别 key → 展示标签；未知类别原样返回。"""
+    try:
+        return TYPE_LABELS.get(DetectionType(cat), cat)
+    except ValueError:
+        return cat
+
+
+def _category_key(label: str) -> str:
+    """展示标签 → 类别 key；无法匹配时保留原字符串（自定义类别）。"""
+    for dtype, lab in TYPE_LABELS.items():
+        if lab == label:
+            return dtype.value
+    return label.strip() if isinstance(label, str) else str(label)
+
+
+def _bump_lexicon_editor() -> None:
+    """递增编辑器版本，强制 data_editor 在词库外部变更后重新加载。"""
+    st.session_state["lexicon_editor_version"] = (
+        st.session_state.get("lexicon_editor_version", 0) + 1
+    )
+
+
+def _lexicon_to_dataframe(lexicon_data: Dict[str, List[str]]) -> pd.DataFrame:
+    """将 {类别: [词条]} 展平为可编辑表格。"""
+    rows = [
+        {"类别": _category_label(cat), "词条": word}
+        for cat, words in lexicon_data.items()
+        for word in words
+    ]
+    if not rows:
+        return pd.DataFrame(
+            {
+                "类别": pd.Series(dtype="string"),
+                "词条": pd.Series(dtype="string"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _dataframe_to_lexicon(df: pd.DataFrame) -> Dict[str, List[str]]:
+    """将编辑后的表格还原为词库结构，去空、去重并保持顺序。"""
+    result: Dict[str, List[str]] = {}
+    if df is None or df.empty:
+        return result
+
+    for _, row in df.iterrows():
+        cat_label = row.get("类别")
+        word = row.get("词条")
+        if pd.isna(cat_label) or pd.isna(word):
+            continue
+        cat = _category_key(str(cat_label))
+        text = str(word).strip()
+        if not cat or not text:
+            continue
+        bucket = result.setdefault(cat, [])
+        if text not in bucket:
+            bucket.append(text)
+    return result
+
+
+def _save_lexicon_dict(lexicon: Dict[str, List[str]]) -> Path:
+    """写入用户词库文件（确保存在后覆盖保存）。"""
+    lexicon_path = _ensure_user_lexicon()
+    with open(lexicon_path, "w", encoding="utf-8") as f:
+        yaml.dump(lexicon, f, allow_unicode=True, default_flow_style=False)
+    return lexicon_path
+
+
+def _render_lexicon_editor() -> None:
+    """侧边栏词库表格编辑器：支持修改类别/词条、增删行。"""
+    lexicon_data = _get_lexicon_data() or {}
+    df = _lexicon_to_dataframe(lexicon_data)
+
+    cat_options = list(
+        dict.fromkeys(
+            [TYPE_LABELS[t] for t in DetectionType]
+            + [_category_label(c) for c in lexicon_data.keys()]
+        )
+    )
+
+    version = st.session_state.get("lexicon_editor_version", 0)
+    st.caption("双击单元格修改；用行末 ➕/🗑️ 增删。改完后点「保存修改」。")
+    edited = st.data_editor(
+        df,
+        column_config={
+            "类别": st.column_config.SelectboxColumn(
+                "类别",
+                options=cat_options,
+                required=True,
+                width="medium",
+            ),
+            "词条": st.column_config.TextColumn(
+                "词条",
+                required=True,
+                width="large",
+            ),
+        },
+        num_rows="dynamic",
+        hide_index=True,
+        key=f"lexicon_data_editor_{version}",
+        height=260,
+        width="stretch",
+    )
+
+    save_col, reset_col = st.columns(2)
+    with save_col:
+        if st.button("💾 保存修改", key="save_lexicon_btn", width="stretch"):
+            new_lexicon = _dataframe_to_lexicon(edited)
+            _save_lexicon_dict(new_lexicon)
+            _bump_lexicon_editor()
+            st.toast(f"已保存 {sum(len(v) for v in new_lexicon.values())} 条词条")
+            st.rerun()
+    with reset_col:
+        if st.button("↩️ 撤销未保存", key="reset_lexicon_btn", width="stretch"):
+            _bump_lexicon_editor()
+            st.rerun()
+
+
+def _add_words_to_lexicon(
+    category: str, words_text: str, custom_category: Optional[str] = None
+) -> bool:
+    """手动添加词条到用户词库。成功写入时返回 True。"""
     if not words_text or not words_text.strip():
         st.warning("请输入词条内容")
-        return
+        return False
 
     # 确定实际类别
     actual_cat = custom_category.strip() if custom_category and custom_category.strip() else category
@@ -878,7 +1004,7 @@ def _add_words_to_lexicon(category: str, words_text: str, custom_category: Optio
 
     if not words:
         st.warning("未识别到有效词条")
-        return
+        return False
 
     lexicon_path = _ensure_user_lexicon()
 
@@ -901,10 +1027,11 @@ def _add_words_to_lexicon(category: str, words_text: str, custom_category: Optio
     if added > 0:
         with open(lexicon_path, "w", encoding="utf-8") as f:
             yaml.dump(existing, f, allow_unicode=True, default_flow_style=False)
-        st.success(f"✅ 成功添加 {added} 条词条到 [{actual_cat}]")
-    else:
-        st.info("ℹ️ 所有词条已存在于词库中")
+        st.toast(f"成功添加 {added} 条词条到 [{actual_cat}]")
+        return True
 
+    st.info("ℹ️ 所有词条已存在于词库中")
+    return False
 
 def _get_lexicon_info() -> Optional[dict]:
     """获取词库统计信息（优先读取用户词库 lexicon.yaml）"""
