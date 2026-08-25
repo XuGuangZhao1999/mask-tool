@@ -100,6 +100,7 @@ def _inject_css():
         padding: 1rem 1.5rem;
         box-shadow: 0 1px 3px rgba(0,0,0,0.08);
         text-align: center;
+        box-sizing: border-box;
     }
     .metric-card .value {
         font-size: 2rem;
@@ -248,47 +249,28 @@ def _inject_css():
 # ──────────────────────────────────────────────
 
 def _extract_text(file_path: Path) -> str:
-    """从文件中提取纯文本"""
+    """从文件中提取纯文本（含页眉页脚、文本框、表格）。"""
     suffix = file_path.suffix.lower()
     if suffix == ".docx":
-        from docx import Document
-        doc = Document(str(file_path))
-        texts = []
-        for p in doc.paragraphs:
-            texts.append(p.text)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    texts.append(cell.text)
-        return "\n".join(texts)
+        return _extract_docx_text(file_path)
     elif suffix == ".xlsx":
         from openpyxl import load_workbook
-        wb = load_workbook(str(file_path), read_only=True)
+        wb = load_workbook(str(file_path), data_only=True, read_only=True)
         texts = []
         for sheet_name in wb.sheetnames:
             sheet = wb[sheet_name]
             for row in sheet.iter_rows():
                 for cell in row:
-                    if cell.value and isinstance(cell.value, str):
-                        texts.append(cell.value)
+                    if cell.value is None:
+                        continue
+                    texts.append(str(cell.value))
         wb.close()
         return "\n".join(texts)
     elif suffix == ".pptx":
-        from pptx import Presentation
-        prs = Presentation(str(file_path))
-        texts = []
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    texts.append(shape.text_frame.text)
-                if shape.has_table:
-                    for row in shape.table.rows:
-                        for cell in row.cells:
-                            texts.append(cell.text)
-        return "\n".join(texts)
+        return _extract_pptx_text(file_path)
     elif suffix == ".pdf":
         try:
-            import fitz
+            import pymupdf as fitz
             doc = fitz.open(str(file_path))
             texts = [page.get_text() for page in doc]
             doc.close()
@@ -296,6 +278,106 @@ def _extract_text(file_path: Path) -> str:
         except ImportError:
             return ""
     return ""
+
+
+def _iter_wml_text(xml_bytes: bytes) -> List[str]:
+    """从 WordprocessingML XML 中按段落拼接 w:t（避免 run 拆词）。"""
+    from xml.etree import ElementTree as ET
+    W_P = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+    W_T = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+    texts: List[str] = []
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return texts
+    for para in root.iter(W_P):
+        para_text = "".join(t.text or "" for t in para.iter(W_T))
+        if para_text.strip():
+            texts.append(para_text)
+    if not texts:
+        leftover = "".join(t.text or "" for t in root.iter(W_T))
+        if leftover.strip():
+            texts.append(leftover)
+    return texts
+
+
+def _extract_docx_text(file_path: Path) -> str:
+    """提取 Word 正文、表格、页眉页脚、文本框、脚注。"""
+    import zipfile
+
+    texts: List[str] = []
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            for name in zf.namelist():
+                if not name.startswith("word/") or not name.endswith(".xml"):
+                    continue
+                stem = name.rsplit("/", 1)[-1]
+                if not any(
+                    stem.startswith(p)
+                    for p in (
+                        "document", "header", "footer",
+                        "footnote", "endnote", "comment",
+                    )
+                ):
+                    continue
+                texts.extend(_iter_wml_text(zf.read(name)))
+    except zipfile.BadZipFile:
+        pass
+
+    zip_text = "\n".join(texts)
+    if zip_text.strip():
+        return zip_text
+
+    # 回退到 python-docx（非标准 docx 时）
+    from docx import Document
+    doc = Document(str(file_path))
+    fallback = []
+    for p in doc.paragraphs:
+        fallback.append(p.text)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                fallback.append(cell.text)
+    return "\n".join(fallback)
+
+
+def _extract_pptx_text(file_path: Path) -> str:
+    """提取 PPT 文本框、表格，并用 XML 兜底。"""
+    from pptx import Presentation
+
+    texts: List[str] = []
+    prs = Presentation(str(file_path))
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                texts.append(shape.text_frame.text)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        texts.append(cell.text)
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                texts.append(slide.notes_slide.notes_text_frame.text)
+        except Exception:
+            pass
+
+    pptx_text = "\n".join(texts)
+    if pptx_text.strip():
+        return pptx_text
+
+    import zipfile
+    from xml.etree import ElementTree as ET
+    A_T = "{http://schemas.openxmlformats.org/drawingml/2006/main}t"
+    extras: List[str] = []
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            for name in zf.namelist():
+                if name.startswith("ppt/slides/") and name.endswith(".xml"):
+                    root = ET.fromstring(zf.read(name))
+                    extras.extend(t.text for t in root.iter(A_T) if t.text)
+    except Exception:
+        pass
+    return "\n".join(extras)
 
 
 def _file_icon(suffix: str) -> str:
@@ -315,34 +397,128 @@ def _confidence_class(confidence: float) -> str:
     return "confidence-low"
 
 
+def _find_config_dir() -> Path:
+    """定位项目 config/ 目录，不依赖启动时的当前工作目录。"""
+    names = ("default.yaml", "lexicon.yaml", "sample_lexicon.yaml")
+
+    def is_config(d: Path) -> bool:
+        return d.is_dir() and any((d / n).exists() for n in names)
+
+    candidates = []
+    cwd = Path.cwd().resolve()
+    for p in [cwd, *cwd.parents]:
+        candidates.append(p / "config")
+        candidates.append(p / "mask-tool-main" / "config")
+
+    here = Path(__file__).resolve()
+    for i in range(min(6, len(here.parents))):
+        candidates.append(here.parents[i] / "config")
+
+    seen = set()
+    for d in candidates:
+        key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_config(d):
+            return d
+
+    fallback = here.parents[3] / "config" if len(here.parents) > 3 else Path.cwd() / "config"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _sample_lexicon_path() -> Path:
+    return _find_config_dir() / "sample_lexicon.yaml"
+
+
+def _user_lexicon_path() -> Path:
+    return _find_config_dir() / "lexicon.yaml"
+
+
+def _ensure_user_lexicon() -> Path:
+    """返回用户词库路径；不存在时从示例词库复制，并确保父目录存在。"""
+    lexicon_path = _user_lexicon_path()
+    if not lexicon_path.exists():
+        lexicon_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_path = _sample_lexicon_path()
+        if sample_path.exists():
+            shutil.copy2(sample_path, lexicon_path)
+        else:
+            lexicon_path.write_text("", encoding="utf-8")
+    return lexicon_path
+
+
+def _normalize_lexicon(data) -> Dict[str, List[str]]:
+    """把 YAML 词库规范成 {类别: [词条, ...]}。
+
+    仅有注释的类别（如 `company:` 后没有列表）会被 PyYAML 解析为 None，
+    不能直接做 `in` 判断。
+    """
+    if not isinstance(data, dict):
+        return {}
+    normalized: Dict[str, List[str]] = {}
+    for key, value in data.items():
+        if isinstance(value, list):
+            normalized[str(key)] = [
+                item.strip() for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+        else:
+            normalized[str(key)] = []
+    return normalized
+
+
+def _absolutize_config_paths(cfg: MaskConfig, config_file: Path) -> None:
+    """将词库/白名单相对路径解析为相对配置文件所在项目的绝对路径。"""
+    project_root = (
+        config_file.parent.parent
+        if config_file.parent.name == "config"
+        else config_file.parent
+    )
+    for attr in ("lexicon_path", "whitelist_path"):
+        value = getattr(cfg, attr, "")
+        if not value:
+            continue
+        p = Path(value)
+        if not p.is_absolute():
+            setattr(cfg, attr, str((project_root / p).resolve()))
+
+
 def _load_config(mode: str, config_path: Optional[str] = None) -> MaskConfig:
     """加载配置，如果用户词库不存在则从示例词库复制"""
     if config_path and Path(config_path).exists():
-        cfg = MaskConfig.from_yaml(Path(config_path))
+        cfg_file = Path(config_path)
+        cfg = MaskConfig.from_yaml(cfg_file)
         cfg.mode = mode
+        _absolutize_config_paths(cfg, cfg_file)
         _ensure_lexicon_exists(cfg)
         return cfg
 
-    # 尝试默认配置路径
     default_paths = [
-        Path("config/default.yaml"),
-        Path(__file__).parent.parent.parent / "config" / "default.yaml",
+        Path.cwd() / "config" / "default.yaml",
+        _find_config_dir() / "default.yaml",
     ]
     for p in default_paths:
         if p.exists():
             cfg = MaskConfig.from_yaml(p)
             cfg.mode = mode
+            _absolutize_config_paths(cfg, p)
             _ensure_lexicon_exists(cfg)
             return cfg
 
-    return MaskConfig(mode=mode)
+    cfg = MaskConfig(mode=mode)
+    cfg.resolve_paths()
+    return cfg
 
 
 def _ensure_lexicon_exists(cfg: MaskConfig) -> None:
     """如果用户词库文件不存在，从示例词库复制"""
     lexicon_path = Path(cfg.lexicon_path)
     if not lexicon_path.exists():
-        sample_path = Path("config/sample_lexicon.yaml")
+        sample_path = lexicon_path.parent / "sample_lexicon.yaml"
+        if not sample_path.exists():
+            sample_path = _sample_lexicon_path()
         if sample_path.exists():
             lexicon_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(sample_path, lexicon_path)
@@ -379,6 +555,13 @@ def _results_to_dataframe(results: List[DetectionResult]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _office_replace():
+    """加载 office_replace。Streamlit 会缓存旧模块，这里每次从磁盘重新加载。"""
+    import importlib
+    from mask_tool.core import office_replace as mod
+    return importlib.reload(mod)
+
+
 def _do_mask_file(
     input_path: Path,
     output_dir: Path,
@@ -387,90 +570,57 @@ def _do_mask_file(
 ) -> Optional[Path]:
     """对单个文件执行脱敏（基于用户确认的结果）
 
-    流程：先用 mask_text 在纯文本上生成 Token 映射，
-    再用 (original -> token) 映射在原始文件上做替换。
+    按确认项生成 Token，再在原始文件里做跨 run 替换（页眉/页脚/文本框也会处理）。
     """
+    from mask_tool.models.mapping import TokenMapping
+
+    orpl = _office_replace()
     suffix = input_path.suffix.lower()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{input_path.stem}_masked{suffix}"
 
-    # 1. 先在纯文本上执行 mask_text，生成 original -> token 映射
-    text = _extract_text(input_path)
-    if text.strip():
-        pipeline.masker.mask_text(text, confirmed_results)
-
-    # 2. 构建替换映射表：original -> token
+    # 直接根据确认项生成映射，不依赖「整词必须出现在某次抽取结果里」
     replace_map: Dict[str, str] = {}
-    for m in pipeline.masker.get_mappings():
-        replace_map[m.original] = m.token
+    existing = {m.original: m.token for m in pipeline.masker.get_mappings()}
+    sorted_results = sorted(
+        [r for r in confirmed_results if r.text],
+        key=lambda r: len(r.text),
+        reverse=True,
+    )
+    for result in sorted_results:
+        if result.text in replace_map:
+            continue
+        if result.text in existing:
+            replace_map[result.text] = existing[result.text]
+            continue
+        if pipeline.masker.irreversible:
+            token = "***"
+        else:
+            token = pipeline.masker.token_gen.generate(result.text, result.text_type)
+            pipeline.masker.mappings.append(TokenMapping(
+                token=token,
+                original=result.text,
+                text_type=result.text_type,
+                confidence=result.confidence,
+            ))
+        replace_map[result.text] = token
+        existing[result.text] = replace_map[result.text]
 
     if not replace_map:
-        # 没有需要替换的内容，直接复制原文件
         shutil.copy2(input_path, output_path)
         return output_path
 
-    # 3. 在原始文件上执行替换（保持格式）
     if suffix == ".docx":
-        from docx import Document
-        doc = Document(str(input_path))
-        # 段落
-        for paragraph in doc.paragraphs:
-            for run in paragraph.runs:
-                for original, token in replace_map.items():
-                    if original in run.text:
-                        run.text = run.text.replace(original, token)
-        # 表格
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        for run in paragraph.runs:
-                            for original, token in replace_map.items():
-                                if original in run.text:
-                                    run.text = run.text.replace(original, token)
-        doc.save(str(output_path))
-
+        orpl.mask_docx(input_path, output_path, replace_map)
     elif suffix == ".xlsx":
-        from openpyxl import load_workbook
-        wb = load_workbook(str(input_path))
-        for sheet_name in wb.sheetnames:
-            sheet = wb[sheet_name]
-            for row in sheet.iter_rows():
-                for cell in row:
-                    if cell.value and isinstance(cell.value, str):
-                        for original, token in replace_map.items():
-                            if original in cell.value:
-                                cell.value = cell.value.replace(original, token)
-        wb.save(str(output_path))
-
+        orpl.mask_xlsx(input_path, output_path, replace_map)
     elif suffix == ".pptx":
-        from pptx import Presentation
-        prs = Presentation(str(input_path))
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        for run in para.runs:
-                            for original, token in replace_map.items():
-                                if original in run.text:
-                                    run.text = run.text.replace(original, token)
-                if shape.has_table:
-                    for row in shape.table.rows:
-                        for cell in row.cells:
-                            if cell.text_frame:
-                                for para in cell.text_frame.paragraphs:
-                                    for run in para.runs:
-                                        for original, token in replace_map.items():
-                                            if original in run.text:
-                                                run.text = run.text.replace(original, token)
-        prs.save(str(output_path))
-
+        orpl.mask_pptx(input_path, output_path, replace_map)
+    elif suffix == ".pdf":
+        orpl.mask_pdf(input_path, output_path, replace_map)
     else:
-        # PDF 或其他：写纯文本
-        masked_text = text
-        for original, token in replace_map.items():
-            masked_text = masked_text.replace(original, token)
-        output_path.write_text(masked_text, encoding="utf-8")
+        text = _extract_text(input_path)
+        output_path.write_text(orpl.apply_to_text(text, replace_map), encoding="utf-8")
 
     return output_path
 
@@ -481,64 +631,25 @@ def _do_mask_file(
 
 def _unmask_docx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏 docx 文件。tokens 格式: {token_str: original_str}"""
-    from docx import Document
-    shutil.copy2(input_path, output_path)
-    doc = Document(str(output_path))
-    for paragraph in doc.paragraphs:
-        for run in paragraph.runs:
-            for token, original in tokens.items():
-                if token in run.text:
-                    run.text = run.text.replace(token, original)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        for token, original in tokens.items():
-                            if token in run.text:
-                                run.text = run.text.replace(token, original)
-    doc.save(str(output_path))
+    from mask_tool.core.office_replace import mask_docx
+    mask_docx(input_path, output_path, tokens)
 
 
 def _unmask_xlsx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏 xlsx 文件。tokens 格式: {token_str: original_str}"""
-    from openpyxl import load_workbook
-    shutil.copy2(input_path, output_path)
-    wb = load_workbook(str(output_path))
-    for sheet_name in wb.sheetnames:
-        sheet = wb[sheet_name]
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.value and isinstance(cell.value, str):
-                    for token, original in tokens.items():
-                        if token in cell.value:
-                            cell.value = cell.value.replace(token, original)
-    wb.save(str(output_path))
+    from mask_tool.core.office_replace import mask_xlsx
+    mask_xlsx(input_path, output_path, tokens)
 
 
 def _unmask_pptx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏 pptx 文件。tokens 格式: {token_str: original_str}"""
-    from pptx import Presentation
-    shutil.copy2(input_path, output_path)
-    prs = Presentation(str(output_path))
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        for token, original in tokens.items():
-                            if token in run.text:
-                                run.text = run.text.replace(token, original)
-            if shape.has_table:
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        if cell.text_frame:
-                            for para in cell.text_frame.paragraphs:
-                                for run in para.runs:
-                                    for token, original in tokens.items():
-                                        if token in run.text:
-                                            run.text = run.text.replace(token, original)
-    prs.save(str(output_path))
+    from mask_tool.core.office_replace import mask_pptx
+    mask_pptx(input_path, output_path, tokens)
+
+
+def _unmask_pdf(input_path: Path, output_path: Path, tokens: dict) -> None:
+    """反脱敏 pdf 文件。tokens 格式: {token_str: original_str}"""
+    _office_replace().mask_pdf(input_path, output_path, tokens)
 
 
 def _unmask_file(input_path: Path, output_path: Path, tokens: dict) -> Optional[Path]:
@@ -551,12 +662,13 @@ def _unmask_file(input_path: Path, output_path: Path, tokens: dict) -> Optional[
             _unmask_xlsx(input_path, output_path, tokens)
         elif suffix == ".pptx":
             _unmask_pptx(input_path, output_path, tokens)
+        elif suffix == ".pdf":
+            _unmask_pdf(input_path, output_path, tokens)
         else:
             # 纯文本文件
             text = input_path.read_text(encoding="utf-8")
-            for token, original in tokens.items():
-                text = text.replace(token, original)
-            output_path.write_text(text, encoding="utf-8")
+            from mask_tool.core.office_replace import apply_to_text
+            output_path.write_text(apply_to_text(text, tokens), encoding="utf-8")
         return output_path
     except Exception as e:
         st.error(f"反脱敏 {input_path.name} 时出错: {e}")
@@ -738,17 +850,11 @@ def render_sidebar():
 def _get_lexicon_data() -> Optional[Dict[str, List[str]]]:
     """读取词库完整数据（分类别返回词条列表）"""
     try:
-        config_paths = [
-            Path("config/lexicon.yaml"),
-            Path("config/sample_lexicon.yaml"),
-            Path(__file__).parent.parent.parent / "config" / "lexicon.yaml",
-            Path(__file__).parent.parent.parent / "config" / "sample_lexicon.yaml",
-        ]
-        for p in config_paths:
+        config_dir = _find_config_dir()
+        for p in (config_dir / "lexicon.yaml", config_dir / "sample_lexicon.yaml"):
             if p.exists():
                 with open(p, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                return {k: v for k, v in data.items() if isinstance(v, list)}
+                    return _normalize_lexicon(yaml.safe_load(f))
     except Exception:
         pass
     return None
@@ -774,18 +880,11 @@ def _add_words_to_lexicon(category: str, words_text: str, custom_category: Optio
         st.warning("未识别到有效词条")
         return
 
-    # 确保用户词库存在
-    lexicon_path = Path("config/lexicon.yaml")
-    if not lexicon_path.exists():
-        sample_path = Path("config/sample_lexicon.yaml")
-        if sample_path.exists():
-            shutil.copy2(sample_path, lexicon_path)
-        else:
-            lexicon_path.write_text("", encoding="utf-8")
+    lexicon_path = _ensure_user_lexicon()
 
     # 读取现有词库
     with open(lexicon_path, "r", encoding="utf-8") as f:
-        existing = yaml.safe_load(f) or {}
+        existing = _normalize_lexicon(yaml.safe_load(f))
 
     # 确保类别存在
     if actual_cat not in existing:
@@ -810,18 +909,12 @@ def _add_words_to_lexicon(category: str, words_text: str, custom_category: Optio
 def _get_lexicon_info() -> Optional[dict]:
     """获取词库统计信息（优先读取用户词库 lexicon.yaml）"""
     try:
-        # 按优先级查找词库文件
-        config_paths = [
-            Path("config/lexicon.yaml"),
-            Path("config/sample_lexicon.yaml"),
-            Path(__file__).parent.parent.parent / "config" / "lexicon.yaml",
-            Path(__file__).parent.parent.parent / "config" / "sample_lexicon.yaml",
-        ]
-        for p in config_paths:
+        config_dir = _find_config_dir()
+        for p in (config_dir / "lexicon.yaml", config_dir / "sample_lexicon.yaml"):
             if p.exists():
                 with open(p, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                categories = {k: len(v) for k, v in data.items() if isinstance(v, list)}
+                    data = _normalize_lexicon(yaml.safe_load(f))
+                categories = {k: len(v) for k, v in data.items()}
                 return {
                     "total": sum(categories.values()),
                     "categories": categories,
@@ -841,19 +934,11 @@ def _import_lexicon(uploaded_file) -> None:
     """
     import io
 
-    # 确定用户词库路径
-    lexicon_path = Path("config/lexicon.yaml")
-    if not lexicon_path.exists():
-        # 从示例词库复制
-        sample_path = Path("config/sample_lexicon.yaml")
-        if sample_path.exists():
-            shutil.copy2(sample_path, lexicon_path)
-        else:
-            lexicon_path.write_text("", encoding="utf-8")
+    lexicon_path = _ensure_user_lexicon()
 
     # 读取现有词库
     with open(lexicon_path, "r", encoding="utf-8") as f:
-        existing = yaml.safe_load(f) or {}
+        existing = _normalize_lexicon(yaml.safe_load(f))
 
     # 确保所有类别键存在
     valid_categories = [t.value for t in DetectionType]
@@ -962,6 +1047,15 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
         st.info("📤 请上传需要脱敏的文件（支持 .docx / .xlsx / .pptx / .pdf）")
         return
 
+    file_sig = tuple((f.name, getattr(f, "size", 0)) for f in uploaded_files)
+    if st.session_state.get("upload_sig") != file_sig:
+        st.session_state["upload_sig"] = file_sig
+        for key in [
+            "detection_results", "file_results", "user_selections",
+            "learn_set", "extract_stats", "lexicon_meta", "grid_sel_rev",
+        ]:
+            st.session_state.pop(key, None)
+
     # 显示已上传文件
     st.markdown("#### 📁 已上传文件")
     file_cols = st.columns(min(len(uploaded_files), 4))
@@ -996,68 +1090,88 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
     file_results = st.session_state["file_results"]
 
     if not all_results:
-        st.success("✅ 未检测到敏感信息，文件安全！")
+        st.warning("未检测到敏感信息")
+        meta = st.session_state.get("lexicon_meta") or {}
+        stats = st.session_state.get("extract_stats") or []
+        if meta:
+            st.caption(
+                f"已加载词库 **{meta.get('count', 0)}** 条 · `{meta.get('path', '')}`"
+            )
+        for s in stats:
+            chars = s.get("chars", 0)
+            st.caption(f"{s.get('name', '')}: 提取 {chars} 字")
+            if chars == 0:
+                st.error(
+                    "未能从该文件提取到文本。扫描件 PDF 当前未启用 OCR；"
+                    "旧版 .doc 请另存为 .docx。"
+                )
+            elif meta.get("count", 0) == 0:
+                st.error("词库为空。请先在左侧「词库管理」添加关键词后重新检测。")
+            else:
+                st.info(
+                    "已提取到文本，但其中没有出现词库里的完整词条"
+                    "（需与词库用词完全一致，例如「合肥卷烟厂」）。"
+                )
+                preview = s.get("preview") or ""
+                if preview:
+                    with st.expander("查看提取文本预览"):
+                        st.text(preview)
         return
 
     # ── 检测结果统计 ──
     st.markdown("#### 📊 检测结果概览")
 
-    # 统计卡片
-    col1, col2, col3, col4 = st.columns(4)
     auto_count = sum(1 for r in all_results if r.status == DetectionStatus.AUTO_MASK)
     suggest_count = sum(1 for r in all_results if r.status == DetectionStatus.SUGGEST_MASK)
     hint_count = sum(1 for r in all_results if r.status == DetectionStatus.HINT_ONLY)
 
-    with col1:
-        st.markdown(
-            f'<div class="metric-card"><div class="value">{len(all_results)}</div><div class="label">检测总数</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col2:
-        st.markdown(
-            f'<div class="metric-card"><div class="value" style="color:#27ae60">{auto_count}</div><div class="label">自动脱敏</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col3:
-        st.markdown(
-            f'<div class="metric-card"><div class="value" style="color:#f39c12">{suggest_count}</div><div class="label">建议脱敏</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col4:
-        st.markdown(
-            f'<div class="metric-card"><div class="value" style="color:#95a5a6">{hint_count}</div><div class="label">仅提示</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    # 类别分布
     type_counts: Dict[str, int] = {}
     for r in all_results:
         label = TYPE_LABELS.get(r.text_type, r.text_type.value)
         type_counts[label] = type_counts.get(label, 0) + 1
 
-    if type_counts:
-        chart_cols = st.columns([2, 1])
-        with chart_cols[0]:
-            # 用原生 HTML 条形图代替 st.bar_chart（避免 pyarrow 依赖）
-            sorted_counts = sorted(type_counts.items(), key=lambda x: x[1])
-            max_val = max(type_counts.values()) if type_counts else 1
-            bars_html = '<div style="font-size:0.85rem;">'
-            for label, count in sorted_counts:
-                pct = int(count / max_val * 100)
-                bars_html += (
-                    f'<div style="display:flex;align-items:center;margin-bottom:4px;">'
-                    f'<span style="width:120px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{label}</span>'
-                    f'<div style="flex:1;background:#eee;border-radius:4px;height:22px;position:relative;">'
-                    f'<div style="background:linear-gradient(90deg,#667eea,#764ba2);width:{pct}%;height:100%;border-radius:4px;min-width:2px;"></div>'
-                    f'<span style="position:absolute;right:6px;top:2px;font-size:0.78rem;font-weight:600;">{count}</span>'
-                    f'</div></div>'
-                )
-            bars_html += '</div>'
-            st.markdown(bars_html, unsafe_allow_html=True)
-        with chart_cols[1]:
-            st.markdown("**类别分布**")
-            for label, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-                st.markdown(f"- {label}: **{count}** 项")
+    with st.container(gap="medium"):
+        col1, col2, col3, col4 = st.columns(4, gap="small")
+        with col1:
+            st.html(
+                f'<div class="metric-card"><div class="value">{len(all_results)}</div><div class="label">检测总数</div></div>',
+            )
+        with col2:
+            st.html(
+                f'<div class="metric-card"><div class="value" style="color:#27ae60">{auto_count}</div><div class="label">自动脱敏</div></div>',
+            )
+        with col3:
+            st.html(
+                f'<div class="metric-card"><div class="value" style="color:#f39c12">{suggest_count}</div><div class="label">建议脱敏</div></div>',
+            )
+        with col4:
+            st.html(
+                f'<div class="metric-card"><div class="value" style="color:#95a5a6">{hint_count}</div><div class="label">仅提示</div></div>',
+            )
+
+        if type_counts:
+            chart_cols = st.columns([2, 1], gap="medium")
+            with chart_cols[0]:
+                # 用原生 HTML 条形图代替 st.bar_chart（避免 pyarrow 依赖）
+                sorted_counts = sorted(type_counts.items(), key=lambda x: x[1])
+                max_val = max(type_counts.values()) if type_counts else 1
+                bars_html = '<div style="font-size:0.85rem;padding-top:0.25rem;">'
+                for label, count in sorted_counts:
+                    pct = int(count / max_val * 100)
+                    bars_html += (
+                        f'<div style="display:flex;align-items:center;margin:6px 0;">'
+                        f'<span style="width:120px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{label}</span>'
+                        f'<div style="flex:1;background:#eee;border-radius:4px;height:22px;position:relative;">'
+                        f'<div style="background:linear-gradient(90deg,#667eea,#764ba2);width:{pct}%;height:100%;border-radius:4px;min-width:2px;"></div>'
+                        f'<span style="position:absolute;right:6px;top:2px;font-size:0.78rem;font-weight:600;">{count}</span>'
+                        f'</div></div>'
+                    )
+                bars_html += '</div>'
+                st.html(bars_html)
+            with chart_cols[1]:
+                st.markdown("**类别分布**")
+                for label, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+                    st.markdown(f"- {label}: **{count}** 项")
 
     # ── Step 3: 确认选择 ──
     st.markdown("---")
@@ -1137,37 +1251,42 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
                 continue
         filtered_indices.append(i)
 
+    def _commit_batch_selection() -> None:
+        """批量改选后刷新表格勾选状态。"""
+        st.session_state["grid_sel_rev"] = st.session_state.get("grid_sel_rev", 0) + 1
+        st.rerun()
+
     # 批量操作按钮
     batch_cols = st.columns(6)
     with batch_cols[0]:
         if st.button("☑️ 全选当前", width="stretch"):
             for i in filtered_indices:
                 st.session_state["user_selections"][i] = True
-            st.rerun()
+            _commit_batch_selection()
     with batch_cols[1]:
         if st.button("☐️ 取消全选", width="stretch"):
             for i in filtered_indices:
                 st.session_state["user_selections"][i] = False
-            st.rerun()
+            _commit_batch_selection()
     with batch_cols[2]:
         if st.button("🔄 反选", width="stretch"):
             for i in filtered_indices:
                 st.session_state["user_selections"][i] = not st.session_state["user_selections"][i]
-            st.rerun()
+            _commit_batch_selection()
     with batch_cols[3]:
         if st.button("✅ 仅选自动脱敏", width="stretch"):
             for i in filtered_indices:
                 st.session_state["user_selections"][i] = (
                     all_results[i].status == DetectionStatus.AUTO_MASK
                 )
-            st.rerun()
+            _commit_batch_selection()
     with batch_cols[4]:
         if st.button("⚠️ 仅选建议脱敏", width="stretch"):
             for i in filtered_indices:
                 st.session_state["user_selections"][i] = (
                     all_results[i].status == DetectionStatus.SUGGEST_MASK
                 )
-            st.rerun()
+            _commit_batch_selection()
     with batch_cols[5]:
         if st.button("📚 全部加入词库", width="stretch"):
             for i in filtered_indices:
@@ -1175,24 +1294,17 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
                 if "learn_set" not in st.session_state:
                     st.session_state["learn_set"] = set()
                 st.session_state["learn_set"].add(i)
-            st.rerun()
+            _commit_batch_selection()
 
-    # 选中计数
-    selected_count = sum(
-        1 for i in filtered_indices if st.session_state["user_selections"].get(i, False)
-    )
-    st.caption(f"当前显示 {len(filtered_indices)} 项，已选中 **{selected_count}** 项")
+    count_slot = st.empty()
 
-    # 检测结果表格（使用 AgGrid，勾选不触发 rerun）
+    # 检测结果表格：用原生勾选，勾选结果写回脱敏项
     if filtered_indices:
-        from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
-
         display_rows = []
         for i in filtered_indices:
             r = all_results[i]
             display_rows.append({
                 "index": i,
-                "选择": st.session_state["user_selections"].get(i, False),
                 "敏感信息": r.text,
                 "类别": TYPE_LABELS.get(r.text_type, r.text_type.value),
                 "来源": SOURCE_LABELS.get(r.source, r.source),
@@ -1203,73 +1315,42 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
             })
 
         df_display = pd.DataFrame(display_rows)
-
-        # 构建 AgGrid 配置（兼容不同版本的参数命名）
-        gb = GridOptionsBuilder.from_dataframe(df_display)
-        gb.configure_column("index", hide=True)
-        gb.configure_column("选择", headerCheckboxSelection=True, editable=True)
-        gb.configure_column("敏感信息", editable=False)
-        gb.configure_column("类别", editable=False)
-        gb.configure_column("来源", editable=False)
-        gb.configure_column("置信度", editable=False, type=["numericColumn"], precisionFormat=2)
-        gb.configure_column("处置", editable=False)
-        gb.configure_column("文件", editable=False)
-        gb.configure_column("上下文", editable=False)
-        # configure_selection: 兼容 camelCase / snake_case / 旧版参数
-        try:
-            gb.configure_selection(selectionMode="multiple", useCheckbox=True, preSelectedRows=[
-                j for j, row in enumerate(display_rows) if row["选择"]
-            ])
-        except TypeError:
-            try:
-                gb.configure_selection(
-                    selection_mode="multiple", use_checkbox=True,
-                    pre_selected_rows=[j for j, row in enumerate(display_rows) if row["选择"]],
-                )
-            except TypeError:
-                gb.configure_selection("multiple", use_checkbox=True)
-        # configure_pagination: 兼容不同版本
-        try:
-            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=30)
-        except TypeError:
-            try:
-                gb.configure_pagination(pagination_auto_page_size=False, pagination_page_size=30)
-            except TypeError:
-                gb.configure_pagination(paginationPageSize=30)
-        gridOptions = gb.build()
-
-        # 渲染 AgGrid（fit_column=True 自动列宽）
-        grid_response = AgGrid(
-            df_display,
-            gridOptions=gridOptions,
-            update_mode=GridUpdateMode.NO_UPDATE,
-            fit_columns_on_grid_load=True,
-            height=500,
-            allow_unsafe_jscode=True,
-            theme="streamlit",
+        default_rows = [
+            j for j, row in enumerate(display_rows)
+            if st.session_state["user_selections"].get(row["index"], False)
+        ]
+        grid_key = (
+            f"detection_grid_{st.session_state.get('grid_sel_rev', 0)}_"
+            f"{filter_type}|{filter_status}|{filter_source}|{filter_file}|{search_text}"
         )
+        grid_event = st.dataframe(
+            df_display,
+            key=grid_key,
+            on_select="rerun",
+            selection_mode="multi-row",
+            selection_default={"selection": {"rows": default_rows}},
+            hide_index=True,
+            width="stretch",
+            height=500,
+            column_config={
+                "index": None,
+                "置信度": st.column_config.NumberColumn("置信度", format="%.2f"),
+            },
+        )
+        selected_orig = set()
+        for j in grid_event.selection.rows:
+            if 0 <= j < len(display_rows):
+                selected_orig.add(int(display_rows[j]["index"]))
+        for i in filtered_indices:
+            st.session_state["user_selections"][i] = i in selected_orig
 
-        # 从 AgGrid 响应中同步选择状态
-        selected_rows = grid_response.get("selected_rows")
-        if selected_rows is not None:
-            selected_indices_in_grid = set()
-            for row in selected_rows:
-                idx = int(row.get("index", -1))
-                if idx >= 0:
-                    selected_indices_in_grid.add(idx)
-            # 更新 session_state
-            changed = False
-            for i in filtered_indices:
-                new_val = i in selected_indices_in_grid
-                if st.session_state["user_selections"].get(i) != new_val:
-                    st.session_state["user_selections"][i] = new_val
-                    changed = True
-            # 如果选择状态有变化，更新计数显示（不 rerun 整个页面）
-            if changed:
-                selected_count = sum(
-                    1 for i in filtered_indices if st.session_state["user_selections"].get(i, False)
-                )
-                st.caption(f"当前显示 {len(filtered_indices)} 项，已选中 **{selected_count}** 项")
+    selected_count = sum(
+        1 for i in filtered_indices if st.session_state["user_selections"].get(i, False)
+    )
+    count_slot.caption(
+        f"当前显示 {len(filtered_indices)} 项，已选中 **{selected_count}** 项。"
+        "在表格左侧勾选要脱敏的项。"
+    )
 
     # ── Step 4: 执行脱敏 ──
     st.markdown("---")
@@ -1330,7 +1411,7 @@ def _render_masking_tab(mode: str, ner_enabled: bool, irreversible: bool, learn_
         )
 
     if re_detect_btn:
-        for key in ["detection_results", "file_results", "user_selections", "learn_set"]:
+        for key in ["detection_results", "file_results", "user_selections", "learn_set", "grid_sel_rev"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
@@ -1398,7 +1479,7 @@ def _render_mask_result():
     # 返回按钮
     if st.button("🔄 返回重新脱敏", width="stretch"):
         del st.session_state["mask_result"]
-        for key in ["detection_results", "file_results", "user_selections", "learn_set"]:
+        for key in ["detection_results", "file_results", "user_selections", "learn_set", "grid_sel_rev"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
@@ -1646,8 +1727,7 @@ def _run_restore(masked_files, tokens: dict):
     saved_paths = []
     for f in masked_files:
         save_path = tmp_dir / f.name
-        with open(save_path, "wb") as fp:
-            fp.write(f.read())
+        save_path.write_bytes(_read_uploaded_bytes(f))
         saved_paths.append(save_path)
 
     # 逐文件恢复
@@ -1692,6 +1772,20 @@ def _run_restore(masked_files, tokens: dict):
 # 检测流程
 # ──────────────────────────────────────────────
 
+def _read_uploaded_bytes(uploaded_file) -> bytes:
+    """读取 Streamlit 上传文件字节，避免指针已偏移导致空内容。"""
+    if hasattr(uploaded_file, "getvalue"):
+        data = uploaded_file.getvalue()
+        if data:
+            return data
+    if hasattr(uploaded_file, "seek"):
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+    return uploaded_file.read() or b""
+
+
 def _run_detection(uploaded_files, mode: str, ner_enabled: bool):
     """执行检测流程"""
     # 加载配置
@@ -1699,31 +1793,58 @@ def _run_detection(uploaded_files, mode: str, ner_enabled: bool):
     cfg.ner.enabled = ner_enabled
 
     pipeline = Pipeline(cfg)
+    lexicon_count = sum(len(v) for v in pipeline.detector.lexicon.values())
+    st.session_state["lexicon_meta"] = {
+        "count": lexicon_count,
+        "path": cfg.lexicon_path,
+    }
 
     # 保存上传文件到临时目录
     tmp_dir = Path(tempfile.mkdtemp())
     saved_paths = []
     for f in uploaded_files:
         save_path = tmp_dir / f.name
-        with open(save_path, "wb") as fp:
-            fp.write(f.read())
+        data = _read_uploaded_bytes(f)
+        save_path.write_bytes(data)
         saved_paths.append(save_path)
 
     # 逐文件检测
     all_results: List[DetectionResult] = []
     file_results: Dict[str, List[DetectionResult]] = {}
+    extract_stats = []
 
     for file_path in saved_paths:
         try:
+            if file_path.stat().st_size == 0:
+                extract_stats.append({
+                    "name": file_path.name, "chars": 0, "hits": 0,
+                    "preview": "", "error": "保存后的文件为空",
+                })
+                continue
             text = _extract_text(file_path)
-            if not text.strip():
+            chars = len(text.strip())
+            if not chars:
+                extract_stats.append({
+                    "name": file_path.name, "chars": 0, "hits": 0,
+                    "preview": "",
+                })
                 continue
             results = pipeline.detector.detect(text, str(file_path))
             results = pipeline.policy.apply(results)
             all_results.extend(results)
             file_results[file_path.name] = results
+            extract_stats.append({
+                "name": file_path.name,
+                "chars": chars,
+                "hits": len(results),
+                "preview": text[:2000],
+            })
         except Exception as e:
             st.error(f"检测 {file_path.name} 时出错: {e}")
+            extract_stats.append({
+                "name": file_path.name, "chars": 0, "hits": 0,
+                "preview": "", "error": str(e),
+            })
 
     # 跨文件去重
     all_results = _dedup_results(all_results)
@@ -1731,10 +1852,10 @@ def _run_detection(uploaded_files, mode: str, ner_enabled: bool):
     # 存入 session_state
     st.session_state["detection_results"] = all_results
     st.session_state["file_results"] = file_results
+    st.session_state["extract_stats"] = extract_stats
     st.session_state["tmp_dir"] = str(tmp_dir)
     st.session_state["saved_paths"] = [str(p) for p in saved_paths]
 
-    st.success(f"✅ 检测完成！共发现 **{len(all_results)}** 项敏感信息")
     st.rerun()
 
 
@@ -1789,8 +1910,7 @@ def _run_masking(
     for f in uploaded_files:
         save_path = tmp_dir / f.name
         if not save_path.exists():
-            with open(save_path, "wb") as fp:
-                fp.write(f.read())
+            save_path.write_bytes(_read_uploaded_bytes(f))
         saved_paths.append(save_path)
 
     # 输出目录
@@ -1894,10 +2014,10 @@ def _save_learned_words(learned: dict, config: MaskConfig):
     """将学习到的词追加到词库文件"""
     lexicon_path = Path(config.lexicon_path)
     if not lexicon_path.exists():
-        return
+        lexicon_path = _ensure_user_lexicon()
 
     with open(lexicon_path, "r", encoding="utf-8") as f:
-        existing = yaml.safe_load(f) or {}
+        existing = _normalize_lexicon(yaml.safe_load(f))
 
     new_count = 0
     for category, words in learned.items():

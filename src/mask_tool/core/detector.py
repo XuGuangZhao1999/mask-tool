@@ -80,21 +80,34 @@ class Detector:
         seen_texts: Set[str] = set()
 
         # 1. 词库匹配（最高优先级，置信度0.95）
+        collapsed_text = re.sub(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
         for word, det_type, confidence in self._lexicon_patterns:
-            if word in text and word not in seen_texts:
-                seen_texts.add(word)
+            collapsed_word = re.sub(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", word)
+            if not collapsed_word or word in seen_texts:
+                continue
+            in_raw = word in text
+            in_collapsed = collapsed_word in collapsed_text
+            if not (in_raw or in_collapsed):
+                continue
+            seen_texts.add(word)
+            if in_raw:
                 idx = text.index(word)
                 start = max(0, idx - 50)
                 end = min(len(text), idx + len(word) + 50)
                 context = text[start:end]
-                results.append(DetectionResult(
-                    text=word,
-                    text_type=det_type,
-                    source="dictionary",
-                    confidence=confidence,
-                    location=Location(file=file_path),
-                    context=context,
-                ))
+            else:
+                idx = collapsed_text.index(collapsed_word)
+                start = max(0, idx - 50)
+                end = min(len(collapsed_text), idx + len(collapsed_word) + 50)
+                context = collapsed_text[start:end]
+            results.append(DetectionResult(
+                text=word,
+                text_type=det_type,
+                source="dictionary",
+                confidence=confidence,
+                location=Location(file=file_path),
+                context=context,
+            ))
 
         # 2. NER识别（补充词典未覆盖的实体）
         if self.ner_engine and self.ner_engine.is_available():

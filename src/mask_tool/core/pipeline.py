@@ -22,6 +22,9 @@ class Pipeline:
         self.config = config
         self.report = MaskReport()
 
+        # 无论从 CLI 还是 Web 进入，都把相对路径解析到真实 config/ 目录
+        self.config.resolve_paths()
+
         # 加载词库
         lexicon_store = LexiconStore(config.lexicon_path, config.whitelist_path)
         lexicon = lexicon_store.get_lexicon()
@@ -34,6 +37,23 @@ class Pipeline:
                 from mask_tool.core.ner.jieba_ner import JiebaNER
                 ner_engine = JiebaNER()
                 ner_engine.set_whitelist(whitelist)
+                # 把用户词库加入 jieba，避免自定义专名被切碎
+                tag_map = {
+                    "person": "nr",
+                    "location": "ns",
+                    "company": "nt",
+                    "government": "nt",
+                    "project": "nz",
+                    "subject": "nz",
+                    "custom": "nz",
+                }
+                user_words = []
+                for category, words in lexicon.items():
+                    tag = tag_map.get(category, "nz")
+                    for word in words:
+                        user_words.append((word, 100, tag))
+                if user_words:
+                    ner_engine.add_words(user_words)
             except Exception as e:
                 import logging
                 logging.getLogger("mask_tool").warning(f"NER引擎初始化失败: {e}")
@@ -138,14 +158,14 @@ class Pipeline:
         return output_path
 
     def _process_pdf(self, input_path: Path, output_dir: Path) -> Path:
-        """处理PDF文档（MVP: 仅提取文本并生成报告）"""
+        """处理PDF文档：检测并写回脱敏后的 PDF"""
         try:
             from mask_tool.adapters.pdf_adapter import PdfAdapter
         except ImportError:
             raise RuntimeError(
                 "PDF处理需要安装PyMuPDF: pip install pymupdf"
             )
-        adapter = PdfAdapter(self.detector, self.policy)
+        adapter = PdfAdapter(self.detector, self.policy, self.masker)
         output_path = adapter.process(input_path, output_dir)
         self.report.output_files.append(str(output_path))
         return output_path

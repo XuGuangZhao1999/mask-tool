@@ -34,8 +34,10 @@ Thumbs.db
 
 # Config (user's local config may differ)
 config/local_*.yaml
-config/lexicon.yaml          # 用户自定义词库（不要提交到GitHub）
-config/whitelist_local.yaml  # 用户自定义白名单
+# 用户自定义词库（不要提交到GitHub）
+config/lexicon.yaml
+# 用户自定义白名单
+config/whitelist_local.yaml
 
 # User data
 samples/

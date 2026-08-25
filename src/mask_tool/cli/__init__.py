@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from mask_tool import __version__
-from mask_tool.models.config import MaskConfig
+from mask_tool.models.config import MaskConfig, find_config_dir
 from mask_tool.models.detection import DetectionStatus
 from mask_tool.core.pipeline import Pipeline
 
@@ -30,19 +30,23 @@ def _load_config(config_path: Optional[Path], mode: str) -> MaskConfig:
         if mode != "smart":
             cfg.mode = mode
         return cfg
-    # 尝试加载默认配置
+    # 尝试加载默认配置（不依赖启动时的当前工作目录）
     default_paths = [
         Path("config/default.yaml"),
-        Path(__file__).parent.parent.parent / "config" / "default.yaml",
     ]
+    cfg_dir = find_config_dir()
+    if cfg_dir is not None:
+        default_paths.append(cfg_dir / "default.yaml")
     for p in default_paths:
         if p.exists():
             cfg = MaskConfig.from_yaml(p)
             if mode != "smart":
                 cfg.mode = mode
             return cfg
-    # 无配置文件时使用默认值
-    return MaskConfig(mode=mode)
+    # 无配置文件时使用默认值，但仍解析词库路径
+    cfg = MaskConfig(mode=mode)
+    cfg.resolve_paths()
+    return cfg
 
 
 def _collect_files(input_path: Path) -> List[Path]:
@@ -215,7 +219,7 @@ def unmask(
     console.print(f"加载了 {len(tokens)} 条映射")
 
     # 收集所有文件
-    supported = {".docx", ".xlsx", ".pptx"}
+    supported = {".docx", ".xlsx", ".pptx", ".pdf"}
     files = []
     for p in input_path:
         if p.is_file():
@@ -244,6 +248,8 @@ def unmask(
                 _unmask_xlsx(f, output_path, tokens)
             elif suffix == ".pptx":
                 _unmask_pptx(f, output_path, tokens)
+            elif suffix == ".pdf":
+                _unmask_pdf(f, output_path, tokens)
             else:
                 console.print("[yellow]跳过[/yellow]")
                 continue
@@ -254,66 +260,39 @@ def unmask(
     console.print(f"\n[green]反脱敏完成，输出到: {output}/[/green]")
 
 
+def _flatten_unmask_tokens(tokens: dict) -> dict:
+    """统一为 {token: original}。"""
+    flat = {}
+    for key, value in tokens.items():
+        if isinstance(value, dict) and value.get("original"):
+            flat[str(key)] = value["original"]
+        elif isinstance(value, str):
+            flat[str(key)] = value
+    return flat
+
+
 def _unmask_docx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏Word文档"""
-    from docx import Document
-    shutil.copy2(input_path, output_path)
-    doc = Document(str(output_path))
-    for paragraph in doc.paragraphs:
-        for run in paragraph.runs:
-            for token, info in tokens.items():
-                if token in run.text:
-                    run.text = run.text.replace(token, info["original"])
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        for token, info in tokens.items():
-                            if token in run.text:
-                                run.text = run.text.replace(token, info["original"])
-    doc.save(str(output_path))
+    from mask_tool.core.office_replace import mask_docx
+    mask_docx(input_path, output_path, _flatten_unmask_tokens(tokens))
 
 
 def _unmask_xlsx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏Excel文档"""
-    from openpyxl import load_workbook
-    shutil.copy2(input_path, output_path)
-    wb = load_workbook(str(output_path))
-    for sheet_name in wb.sheetnames:
-        sheet = wb[sheet_name]
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.value and isinstance(cell.value, str):
-                    for token, info in tokens.items():
-                        if token in cell.value:
-                            cell.value = cell.value.replace(token, info["original"])
-    wb.save(str(output_path))
+    from mask_tool.core.office_replace import mask_xlsx
+    mask_xlsx(input_path, output_path, _flatten_unmask_tokens(tokens))
 
 
 def _unmask_pptx(input_path: Path, output_path: Path, tokens: dict) -> None:
     """反脱敏PPT文档"""
-    from pptx import Presentation
-    shutil.copy2(input_path, output_path)
-    prs = Presentation(str(output_path))
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        for token, info in tokens.items():
-                            if token in run.text:
-                                run.text = run.text.replace(token, info["original"])
-            if shape.has_table:
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        if cell.text_frame:
-                            for para in cell.text_frame.paragraphs:
-                                for run in para.runs:
-                                    for token, info in tokens.items():
-                                        if token in run.text:
-                                            run.text = run.text.replace(token, info["original"])
-    prs.save(str(output_path))
+    from mask_tool.core.office_replace import mask_pptx
+    mask_pptx(input_path, output_path, _flatten_unmask_tokens(tokens))
+
+
+def _unmask_pdf(input_path: Path, output_path: Path, tokens: dict) -> None:
+    """反脱敏PDF文档"""
+    from mask_tool.core.office_replace import mask_pdf
+    mask_pdf(input_path, output_path, _flatten_unmask_tokens(tokens))
 
 
 @app.command()
@@ -392,7 +371,7 @@ def _extract_text(file_path: Path) -> str:
                     texts.append(shape.text_frame.text)
         return "\n".join(texts)
     elif suffix == ".pdf":
-        import fitz
+        import pymupdf as fitz
         doc = fitz.open(str(file_path))
         texts = []
         for page in doc:

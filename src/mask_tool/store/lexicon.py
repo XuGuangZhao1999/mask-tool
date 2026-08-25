@@ -22,7 +22,16 @@ class LexiconStore:
         if self.lexicon_path.exists():
             with open(self.lexicon_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-            self._lexicon = {k: v for k, v in data.items() if isinstance(v, list)}
+            if not isinstance(data, dict):
+                data = {}
+            self._lexicon = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    self._lexicon[k] = [
+                        w for w in v if isinstance(w, str) and w.strip()
+                    ]
+                else:
+                    self._lexicon[k] = []
 
         # 加载白名单
         if self.whitelist_path and self.whitelist_path.exists():
